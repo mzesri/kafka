@@ -64,6 +64,7 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
   val correlationId = 0
   val clientId = "client-Id"
   val tp = new TopicPartition(topic, part)
+  val logDir = "logDir"
   val topicAndPartition = TopicAndPartition(topic, part)
   val group = "my-group"
   val topicResource = new Resource(Topic, topic)
@@ -133,7 +134,9 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
       ApiKeys.TXN_OFFSET_COMMIT -> classOf[TxnOffsetCommitResponse],
       ApiKeys.CREATE_ACLS -> classOf[CreateAclsResponse],
       ApiKeys.DELETE_ACLS -> classOf[DeleteAclsResponse],
-      ApiKeys.DESCRIBE_ACLS -> classOf[DescribeAclsResponse]
+      ApiKeys.DESCRIBE_ACLS -> classOf[DescribeAclsResponse],
+      ApiKeys.ALTER_REPLICA_DIR -> classOf[AlterReplicaDirResponse],
+      ApiKeys.DESCRIBE_LOG_DIRS -> classOf[DescribeLogDirsResponse]
   )
 
   val requestKeyToError = Map[ApiKeys, Nothing => Errors](
@@ -167,7 +170,10 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
     ApiKeys.TXN_OFFSET_COMMIT -> ((resp: TxnOffsetCommitResponse) => resp.errors.get(tp)),
     ApiKeys.CREATE_ACLS -> ((resp: CreateAclsResponse) => resp.aclCreationResponses.asScala.head.error.error),
     ApiKeys.DESCRIBE_ACLS -> ((resp: DescribeAclsResponse) => resp.error.error),
-    ApiKeys.DELETE_ACLS -> ((resp: DeleteAclsResponse) => resp.responses.asScala.head.error.error)
+    ApiKeys.DELETE_ACLS -> ((resp: DeleteAclsResponse) => resp.responses.asScala.head.error.error),
+    ApiKeys.ALTER_REPLICA_DIR -> ((resp: AlterReplicaDirResponse) => resp.responses.get(tp)),
+    ApiKeys.DESCRIBE_LOG_DIRS -> ((resp: DescribeLogDirsResponse) =>
+      if (resp.logDirInfos.size() > 0) resp.logDirInfos.asScala.head._2.error else Errors.CLUSTER_AUTHORIZATION_FAILED)
   )
 
   val requestKeysToAcls = Map[ApiKeys, Map[Resource, Set[Acl]]](
@@ -199,7 +205,9 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
     ApiKeys.TXN_OFFSET_COMMIT -> (groupReadAcl ++ transactionIdWriteAcl),
     ApiKeys.CREATE_ACLS -> clusterAlterAcl,
     ApiKeys.DESCRIBE_ACLS -> clusterDescribeAcl,
-    ApiKeys.DELETE_ACLS -> clusterAlterAcl
+    ApiKeys.DELETE_ACLS -> clusterAlterAcl,
+    ApiKeys.ALTER_REPLICA_DIR -> clusterAlterAcl,
+    ApiKeys.DESCRIBE_LOG_DIRS -> clusterDescribeAcl
   )
 
   @Before
@@ -272,7 +280,8 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
   }
 
   private def createUpdateMetadataRequest = {
-    val partitionState = Map(tp -> new PartitionState(Int.MaxValue, brokerId, Int.MaxValue, List(brokerId).asJava, 2, Seq(brokerId).asJava)).asJava
+    val partitionState = Map(tp -> new UpdateMetadataRequest.PartitionState(
+      Int.MaxValue, brokerId, Int.MaxValue, List(brokerId).asJava, 2, Seq(brokerId).asJava, Seq.empty[Integer].asJava)).asJava
     val securityProtocol = SecurityProtocol.PLAINTEXT
     val brokers = Set(new requests.UpdateMetadataRequest.Broker(brokerId,
       Seq(new requests.UpdateMetadataRequest.EndPoint("localhost", 0, securityProtocol,
@@ -303,8 +312,8 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
   private def leaveGroupRequest = new LeaveGroupRequest.Builder(group, "").build()
 
   private def leaderAndIsrRequest = {
-    new requests.LeaderAndIsrRequest.Builder(brokerId, Int.MaxValue,
-      Map(tp -> new PartitionState(Int.MaxValue, brokerId, Int.MaxValue, List(brokerId).asJava, 2, Seq(brokerId).asJava)).asJava,
+    new requests.LeaderAndIsrRequest.Builder(ApiKeys.LEADER_AND_ISR.latestVersion, brokerId, Int.MaxValue,
+      Map(tp -> new LeaderAndIsrRequest.PartitionState(Int.MaxValue, brokerId, Int.MaxValue, List(brokerId).asJava, 2, Seq(brokerId).asJava, false)).asJava,
       Set(new Node(brokerId, "localhost", 0)).asJava).build()
   }
 
@@ -339,6 +348,10 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
       new ResourceFilter(AdminResourceType.TOPIC, null),
       new AccessControlEntryFilter("User:ANONYMOUS", "*", AclOperation.ANY, AclPermissionType.DENY)))).build()
 
+  private def alterReplicaDirRequest = new AlterReplicaDirRequest.Builder(Collections.singletonMap(tp, logDir)).build()
+
+  private def describeLogDirsRequest = new DescribeLogDirsRequest.Builder(Collections.singleton(tp)).build()
+
 
   @Test
   def testAuthorizationWithTopicExisting() {
@@ -365,7 +378,9 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
       ApiKeys.ALTER_CONFIGS -> alterConfigsRequest,
       ApiKeys.CREATE_ACLS -> createAclsRequest,
       ApiKeys.DELETE_ACLS -> deleteAclsRequest,
-      ApiKeys.DESCRIBE_ACLS -> describeAclsRequest
+      ApiKeys.DESCRIBE_ACLS -> describeAclsRequest,
+      ApiKeys.ALTER_REPLICA_DIR -> alterReplicaDirRequest,
+      ApiKeys.DESCRIBE_LOG_DIRS -> describeLogDirsRequest
     )
 
     for ((key, request) <- requestKeyToRequest) {

@@ -46,6 +46,7 @@ class LogTest {
   val tmpDir = TestUtils.tempDir()
   val logDir = TestUtils.randomPartitionLogDir(tmpDir)
   val mockTime = new MockTime()
+  val time = new MockTime()
   var config: KafkaConfig = null
   val brokerTopicStats = new BrokerTopicStats
 
@@ -150,7 +151,8 @@ class LogTest {
     log.appendAsLeader(records, leaderEpoch = 0)
 
     val nextRecords = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), producerId = pid, producerEpoch = epoch, sequence = 2)
-    log.appendAsLeader(nextRecords, leaderEpoch = 0)
+    try {
+		log.appendAsLeader(nextRecords, leaderEpoch = 0)
     } finally {
       log.close()
     }
@@ -308,7 +310,7 @@ class LogTest {
     val logProps = new Properties()
     logProps.put(LogConfig.MessageFormatVersionProp, "0.10.2")
     val config = LogConfig(logProps)
-    val log = new Log(logDir,
+    new Log(logDir,
       config,
       logStartOffset = 0L,
       recoveryPoint = 0L,
@@ -318,7 +320,8 @@ class LogTest {
       maxProducerIdExpirationMs = 300000,
       producerIdExpirationCheckIntervalMs = 30000,
       topicPartition = Log.parseTopicPartitionName(logDir),
-      stateManager)
+      producerStateManager = stateManager,
+      logDirFailureChannel = null)
 
     EasyMock.verify(stateManager)
   }
@@ -1002,7 +1005,8 @@ class LogTest {
     log.appendAsLeader(records, leaderEpoch = 0)
 
     val nextRecords = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), producerId = pid, producerEpoch = oldEpoch, sequence = 0)
-    log.appendAsLeader(nextRecords, leaderEpoch = 0)
+	try {
+		log.appendAsLeader(nextRecords, leaderEpoch = 0)
     } finally {
       log.close()
     }
@@ -1062,9 +1066,9 @@ class LogTest {
   @Test
   def testLoadEmptyLog() {
     createEmptyLogs(logDir, 0)
-    val log = Log(logDir, logConfig, logStartOffset = 0L, recoveryPoint = 0L, scheduler = time.scheduler,
-      brokerTopicStats = brokerTopicStats, time = time)
-    log.appendAsLeader(TestUtils.singletonRecords(value = "test".getBytes, timestamp = time.milliseconds), leaderEpoch = 0)
+    val log = createLog(logDir, LogConfig())
+    log.appendAsLeader(TestUtils.singletonRecords(value = "test".getBytes, timestamp = mockTime.milliseconds), leaderEpoch = 0)
+	log.close()
   }
 
   /**
@@ -1784,19 +1788,9 @@ class LogTest {
    */
   @Test
   def testOpenDeletesObsoleteFiles() {
-    def createRecords = TestUtils.singletonRecords(value = "test".getBytes, timestamp = time.milliseconds - 1000)
-    val logProps = new Properties()
-    logProps.put(LogConfig.SegmentBytesProp, createRecords.sizeInBytes * 5: java.lang.Integer)
-    logProps.put(LogConfig.SegmentIndexBytesProp, 1000: java.lang.Integer)
-    logProps.put(LogConfig.RetentionMsProp, 999: java.lang.Integer)
-    val config = LogConfig(logProps)
-    var log = Log(logDir,
-      config,
-      logStartOffset = 0L,
-      recoveryPoint = 0L,
-      scheduler = time.scheduler,
-      brokerTopicStats = brokerTopicStats,
-      time = time)
+    def createRecords = TestUtils.singletonRecords(value = "test".getBytes, timestamp = mockTime.milliseconds - 1000)
+    val logConfig = createLogConfig(segmentBytes = createRecords.sizeInBytes * 5, segmentIndexBytes = 1000, retentionMs = 999)
+    var log = createLog(logDir, logConfig)
 
     // append some messages to create some segments
     for (_ <- 0 until 100)
@@ -1805,15 +1799,13 @@ class LogTest {
     // expire all segments
     log.onHighWatermarkIncremented(log.logEndOffset)
     log.deleteOldSegments()
-    log.close()
-
-    log = Log(logDir,
-      config,
-      logStartOffset = 0L,
-      recoveryPoint = 0L,
-      scheduler = time.scheduler,
-      brokerTopicStats = brokerTopicStats,
-      time = time)
+    // The segment files scheduled for physical deletion remain open (until fileDeleteDelayMs has elapsed), causing
+    // errors to arise on Windows if a new Log instance, pointed at those files, attempts to physically delete the
+    // files itself during its startup.  Our solution here is to simply copy the log's files to a fresh directory
+    // and point a new Log instance at those.
+    val log2Dir = TestUtils.randomPartitionLogDir(tmpDir)
+    TestUtils.copyDir(logDir.toPath, log2Dir.toPath)
+    log = createLog(log2Dir, logConfig)
     assertEquals("The deleted segments should be gone.", 1, log.numberOfSegments)
   }
 
@@ -2646,10 +2638,10 @@ class LogTest {
 
     log.close()
 
-    val reloadedLog = createLog(1024)
+    val reloadedLogConfig = createLogConfig(segmentBytes = 1024 * 5)
+    val reloadedLog = createLog(logDir, reloadedLogConfig)
     val abortedTransactions = allAbortedTransactions(reloadedLog)
     assertEquals(List(new AbortedTxn(pid1, 0L, 29L, 8L), new AbortedTxn(pid2, 8L, 74L, 36L)), abortedTransactions)
-    reloadedLog.close()
   }
 
   @Test

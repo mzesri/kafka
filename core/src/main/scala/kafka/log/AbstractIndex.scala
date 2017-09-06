@@ -110,11 +110,7 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
 
       /* Windows won't let us modify the file length while the file is mmapped :-( */
       if (OperatingSystem.IS_WINDOWS)
-<<<<<<< HEAD
         forceUnmap()
-=======
-        forceUnmap(mmap)
->>>>>>> trunk
       try {
         raf.setLength(roundedNewSize)
         mmap = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize)
@@ -230,7 +226,7 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
 
   def closeHandler() = {
     // File handler of the index field will be closed after the mmap is garbage collected
-    CoreUtils.swallow(forceUnmap(mmap))
+    CoreUtils.swallow(forceUnmap())
     mmap = null
   }
 

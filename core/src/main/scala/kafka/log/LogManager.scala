@@ -72,10 +72,27 @@ class LogManager(logDirs: Array[File],
   private val logs = new Pool[TopicPartition, Log]()
   private val logsToBeDeleted = new LinkedBlockingQueue[Log]()
 
-  createAndValidateLogDirs(logDirs)
-  private val dirLocks = lockLogDirs(logDirs)
-  private val recoveryPointCheckpoints = logDirs.map(dir => (dir, new OffsetCheckpointFile(new File(dir, RecoveryPointCheckpointFile)))).toMap
-  private val logStartOffsetCheckpoints = logDirs.map(dir => (dir, new OffsetCheckpointFile(new File(dir, LogStartOffsetCheckpointFile)))).toMap
+  private val _liveLogDirs: ConcurrentLinkedQueue[File] = createAndValidateLogDirs(logDirs, initialOfflineDirs)
+
+  def liveLogDirs: Array[File] = {
+    if (_liveLogDirs.size == logDirs.size)
+      logDirs
+    else
+      _liveLogDirs.asScala.toArray
+  }
+
+  //windows-fix
+  // public, so we can access this from kafka.server.HighwatermarkPersistenceTest
+  val dirLocks = lockLogDirs(liveLogDirs)
+
+  @volatile private var recoveryPointCheckpoints = liveLogDirs.map(dir =>
+    (dir, new OffsetCheckpointFile(new File(dir, RecoveryPointCheckpointFile), logDirFailureChannel))).toMap
+  @volatile private var logStartOffsetCheckpoints = liveLogDirs.map(dir =>
+    (dir, new OffsetCheckpointFile(new File(dir, LogStartOffsetCheckpointFile), logDirFailureChannel))).toMap
+
+  private def offlineLogDirs = logDirs.filterNot(_liveLogDirs.contains)
+  private val preferredLogDirs = new ConcurrentHashMap[TopicPartition, String]()
+
   loadLogs()
 
 
@@ -174,18 +191,57 @@ class LogManager(logDirs: Array[File],
    * Lock all the given directories
    */
   private def lockLogDirs(dirs: Seq[File]): Seq[FileLock] = {
-    dirs.map { dir =>
-      val lock = new FileLock(new File(dir, LockFile))
-      if(!lock.tryLock())
-        throw new KafkaException("Failed to acquire lock on file .lock in " + lock.file.getParentFile.getAbsolutePath + 
-                               ". A Kafka instance in another process or thread is using this directory.")
-      lock
-    }
-      locks.append(lock)
+    //windows-fix
+    val locks = mutable.ArrayBuffer.empty[FileLock]
+    for (dir <- dirs) {
+      try {
+        val lock = new FileLock(new File(dir, LockFile))
+        if (!lock.tryLock()) {
+          lock.destroy()
+          locks.foreach(_.destroy())
+          throw new KafkaException("Failed to acquire lock on file .lock in " + lock.file.getParent +
+            ". A Kafka instance in another process or thread is using this directory.")
+        }
+        locks.append(lock)
+      } catch {
+        case e: IOException =>
+          logDirFailureChannel.maybeAddOfflineLogDir(dir.getAbsolutePath, s"Disk error while locking directory $dir", e)
+      }
     }
     locks
   }
-  
+
+  private def loadLogs(logDir: File, recoveryPoints: Map[TopicPartition, Long], logStartOffsets: Map[TopicPartition, Long]): Unit = {
+    debug("Loading log '" + logDir.getName + "'")
+    val topicPartition = Log.parseTopicPartitionName(logDir)
+    val config = topicConfigs.getOrElse(topicPartition.topic, defaultConfig)
+    val logRecoveryPoint = recoveryPoints.getOrElse(topicPartition, 0L)
+    val logStartOffset = logStartOffsets.getOrElse(topicPartition, 0L)
+
+    val current = Log(
+      dir = logDir,
+      config = config,
+      logStartOffset = logStartOffset,
+      recoveryPoint = logRecoveryPoint,
+      maxProducerIdExpirationMs = maxPidExpirationMs,
+      producerIdExpirationCheckIntervalMs = LogManager.ProducerIdExpirationCheckIntervalMs,
+      scheduler = scheduler,
+      time = time,
+      brokerTopicStats = brokerTopicStats,
+      logDirFailureChannel = logDirFailureChannel)
+
+    if (logDir.getName.endsWith(Log.DeleteDirSuffix)) {
+      this.logsToBeDeleted.add(current)
+    } else {
+      val previous = this.logs.put(topicPartition, current)
+      if (previous != null) {
+        throw new IllegalArgumentException(
+          "Duplicate log directories found: %s, %s!".format(
+            current.dir.getAbsolutePath, previous.dir.getAbsolutePath))
+      }
+    }
+  }
+
   /**
    * Recover and load all logs in the given data directories
    */

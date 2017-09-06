@@ -168,8 +168,9 @@ class LogTest {
     val records = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), producerId = pid, producerEpoch = epoch, sequence = 0)
     log.appendAsLeader(records, leaderEpoch = 0)
 
-    val nextRecords = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), pid = pid, epoch = epoch, sequence = 2)
-    log.appendAsLeader(nextRecords, leaderEpoch = 0)
+    val nextRecords = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), producerId = pid, producerEpoch = epoch, sequence = 2)
+	try {
+      log.appendAsLeader(nextRecords, leaderEpoch = 0)
     } finally {
       log.close()
     }
@@ -627,7 +628,7 @@ class LogTest {
     log.deleteOldSegments()
 
     assertEquals(2, log.logSegments.size)
-    assertEquals(Set(pid2), log.activePids.keySet)
+    assertEquals(Set(pid2), log.activeProducers.keySet)
   }
 
   @Test
@@ -717,7 +718,7 @@ class LogTest {
     assertEquals(Set(pid), log.activeProducers.keySet)
 
     time.sleep(expirationCheckInterval)
-    assertEquals(Set(), log.activePids.keySet)
+    assertEquals(Set(), log.activeProducers.keySet)
   }
 
   @Test
@@ -945,8 +946,9 @@ class LogTest {
     val records = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), producerId = pid, producerEpoch = newEpoch, sequence = 0)
     log.appendAsLeader(records, leaderEpoch = 0)
 
-    val nextRecords = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), pid = pid, epoch = oldEpoch, sequence = 0)
-    log.appendAsLeader(nextRecords, leaderEpoch = 0)
+    val nextRecords = TestUtils.records(List(new SimpleRecord(time.milliseconds, "key".getBytes, "value".getBytes)), producerId = pid, producerEpoch = oldEpoch, sequence = 0)
+	try {
+      log.appendAsLeader(nextRecords, leaderEpoch = 0)
     } finally {
       log.close()
     }
@@ -1870,14 +1872,21 @@ class LogTest {
 
     // expire all segments
     log.deleteOldSegments()
+	log.close()
 
-    log = new Log(logDir,
-                  config,
-                  logStartOffset = 0L,
-                  recoveryPoint = 0L,
-                  scheduler = time.scheduler,
-                  brokerTopicStats = brokerTopicStats,
-                  time = time)
+    // The segment files scheduled for physical deletion remain open (until fileDeleteDelayMs has elapsed), causing
+    // errors to arise on Windows if a new Log instance, pointed at those files, attempts to physically delete the
+    // files itself during its startup.  Our solution here is to simply copy the log's files to a fresh directory
+    // and point a new Log instance at those.
+    val log2Dir = TestUtils.randomPartitionLogDir(tmpDir)
+    TestUtils.copyDir(logDir.toPath, log2Dir.toPath)
+    val log2 = Log(log2Dir,
+      config,
+      logStartOffset = 0L,
+      recoveryPoint = 0L,
+      scheduler = time.scheduler,
+      brokerTopicStats = brokerTopicStats,
+      time = time)
     assertEquals("The deleted segments should be gone.", 1, log2.numberOfSegments)
 
     time.sleep(log.config.fileDeleteDelayMs + 1)
